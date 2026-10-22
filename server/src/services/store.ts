@@ -1,368 +1,354 @@
-import fs from 'fs';
-import path from 'path';
+import crypto from 'crypto';
 
-export interface MetricPoint {
-  timestamp: number;
+export interface AlertConfig {
+  consecutiveThreshold: number;
+  latencyThresholdMs?: number;
+  notifyEmail?: string;
+  notifyWebhook?: string;
+}
+
+export type MonitorStatus = 'up' | 'down' | 'degraded' | 'pending';
+
+export interface Monitor {
+  id: string;
+  name: string;
+  url: string;
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD';
+  headers?: Record<string, string>;
+  body?: string;
+  intervalSeconds: number;
+  timeoutMs: number;
+  status: MonitorStatus;
+  consecutiveFailures: number;
+  consecutiveSuccesses: number;
+  lastCheckedAt?: string;
+  lastLatencyMs?: number;
+  uptimePercent: number;
+  totalChecks: number;
+  successfulChecks: number;
+  alertConfig: AlertConfig;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProbeResult {
+  id: string;
+  monitorId: string;
+  timestamp: string;
   statusCode: number;
   latencyMs: number;
-  success: boolean;
+  isUp: boolean;
   errorMessage?: string;
-  dnsLookupMs?: number;
-  tcpConnectMs?: number;
-  tlsHandshakeMs?: number;
-  ttfbMs?: number;
 }
 
-export interface LatencyPercentiles {
-  p50: number;
-  p75: number;
-  p90: number;
-  p95: number;
-  p99: number;
-  min: number;
-  max: number;
-  avg: number;
-}
-
-export interface MonitorAggregateStats {
+export interface IncidentEvent {
+  id: string;
   monitorId: string;
-  totalChecks: number;
-  successCount: number;
-  failureCount: number;
-  uptimePercentage: number;
-  lastCheckTime?: number;
-  lastStatus?: boolean;
-  latency: LatencyPercentiles;
+  monitorName: string;
+  type: 'incident_started' | 'incident_resolved' | 'latency_spike';
+  message: string;
+  timestamp: string;
+  consecutiveFailures: number;
+  resolvedAt?: string;
 }
 
-export interface StoreSnapshot {
-  version: number;
-  savedAt: number;
-  data: Record<string, MetricPoint[]>;
+export interface CreateMonitorInput {
+  name: string;
+  url: string;
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD';
+  headers?: Record<string, string>;
+  body?: string;
+  intervalSeconds?: number;
+  timeoutMs?: number;
+  alertConfig?: Partial<AlertConfig>;
 }
 
-export class MetricRingBuffer {
-  private buffer: Array<MetricPoint | undefined>;
-  private capacity: number;
-  private head: number = 0;
-  private tail: number = 0;
-  private count: number = 0;
-
-  constructor(capacity: number = 1000) {
-    if (capacity <= 0) {
-      throw new Error('Capacity must be positive integer');
-    }
-    this.capacity = capacity;
-    this.buffer = new Array<MetricPoint | undefined>(capacity);
-  }
-
-  public push(point: MetricPoint): void {
-    this.buffer[this.head] = point;
-    this.head = (this.head + 1) % this.capacity;
-
-    if (this.count < this.capacity) {
-      this.count++;
-    } else {
-      this.tail = (this.tail + 1) % this.capacity;
-    }
-  }
-
-  public toArray(): MetricPoint[] {
-    const result: MetricPoint[] = [];
-    result.length = this.count;
-
-    let readIndex = this.tail;
-    for (let i = 0; i < this.count; i++) {
-      result[i] = this.buffer[readIndex] as MetricPoint;
-      readIndex = (readIndex + 1) % this.capacity;
-    }
-    return result;
-  }
-
-  public getRange(startTimeMs: number, endTimeMs: number = Date.now()): MetricPoint[] {
-    const points = this.toArray();
-    return points.filter((p) => p.timestamp >= startTimeMs && p.timestamp <= endTimeMs);
-  }
-
-  public getLatest(n?: number): MetricPoint[] {
-    const points = this.toArray();
-    if (!n || n >= points.length) {
-      return points;
-    }
-    return points.slice(points.length - n);
-  }
-
-  public size(): number {
-    return this.count;
-  }
-
-  public clear(): void {
-    this.buffer = new Array<MetricPoint | undefined>(this.capacity);
-    this.head = 0;
-    this.tail = 0;
-    this.count = 0;
-  }
+export interface UpdateMonitorInput {
+  name?: string;
+  url?: string;
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD';
+  headers?: Record<string, string>;
+  body?: string;
+  intervalSeconds?: number;
+  timeoutMs?: number;
+  alertConfig?: Partial<AlertConfig>;
 }
 
-export class MetricStore {
-  private buffers: Map<string, MetricRingBuffer> = new Map();
-  private capacityPerMonitor: number;
-  private snapshotFilePath: string;
-  private snapshotIntervalMs: number;
-  private persistTimer: NodeJS.Timeout | null = null;
-  private isPersisting: boolean = false;
+const MAX_PROBES_PER_MONITOR = 1000;
+const MAX_INCIDENT_EVENTS = 500;
 
-  constructor(
-    capacityPerMonitor: number = 2000,
-    snapshotFilePath?: string,
-    snapshotIntervalMs: number = 60000
-  ) {
-    this.capacityPerMonitor = capacityPerMonitor;
-    this.snapshotFilePath =
-      snapshotFilePath ||
-      path.resolve(process.cwd(), 'data', 'pulselog-metrics.json');
-    this.snapshotIntervalMs = snapshotIntervalMs;
+class Store {
+  private monitors: Map<string, Monitor> = new Map();
+  private probeResults: Map<string, ProbeResult[]> = new Map();
+  private incidents: IncidentEvent[] = [];
 
-    this.loadSnapshot();
-    this.startPersistence();
+  constructor() {
+    this.seedDefaultData();
   }
 
-  public record(monitorId: string, point: MetricPoint): void {
-    let buf = this.buffers.get(monitorId);
-    if (!buf) {
-      buf = new MetricRingBuffer(this.capacityPerMonitor);
-      this.buffers.set(monitorId, buf);
-    }
-    buf.push(point);
-  }
-
-  public getHistory(
-    monitorId: string,
-    options?: { startTime?: number; endTime?: number; limit?: number }
-  ): MetricPoint[] {
-    const buf = this.buffers.get(monitorId);
-    if (!buf) {
-      return [];
-    }
-
-    if (options?.startTime !== undefined) {
-      const filtered = buf.getRange(options.startTime, options.endTime ?? Date.now());
-      if (options.limit && options.limit > 0) {
-        return filtered.slice(-options.limit);
-      }
-      return filtered;
-    }
-
-    return buf.getLatest(options?.limit);
-  }
-
-  public getStats(monitorId: string, durationMs?: number): MonitorAggregateStats {
-    const now = Date.now();
-    const startTime = durationMs ? now - durationMs : 0;
-    const points = this.getHistory(monitorId, { startTime, endTime: now });
-
-    const defaultLatency: LatencyPercentiles = {
-      p50: 0,
-      p75: 0,
-      p90: 0,
-      p95: 0,
-      p99: 0,
-      min: 0,
-      max: 0,
-      avg: 0,
-    };
-
-    if (points.length === 0) {
-      return {
-        monitorId,
-        totalChecks: 0,
-        successCount: 0,
-        failureCount: 0,
-        uptimePercentage: 100,
-        latency: defaultLatency,
-      };
-    }
-
-    let successCount = 0;
-    let failureCount = 0;
-    const latencies: number[] = [];
-    let latencySum = 0;
-
-    for (let i = 0; i < points.length; i++) {
-      const p = points[i];
-      if (p.success) {
-        successCount++;
-      } else {
-        failureCount++;
-      }
-      latencies.push(p.latencyMs);
-      latencySum += p.latencyMs;
-    }
-
-    latencies.sort((a, b) => a - b);
-
-    const calcPercentile = (p: number): number => {
-      const index = Math.ceil((p / 100) * latencies.length) - 1;
-      return latencies[Math.max(0, index)];
-    };
-
-    const latestPoint = points[points.length - 1];
-
-    return {
-      monitorId,
-      totalChecks: points.length,
-      successCount,
-      failureCount,
-      uptimePercentage: Number(((successCount / points.length) * 100).toFixed(2)),
-      lastCheckTime: latestPoint.timestamp,
-      lastStatus: latestPoint.success,
-      latency: {
-        p50: calcPercentile(50),
-        p75: calcPercentile(75),
-        p90: calcPercentile(90),
-        p95: calcPercentile(95),
-        p99: calcPercentile(99),
-        min: latencies[0],
-        max: latencies[latencies.length - 1],
-        avg: Math.round(latencySum / latencies.length),
+  private seedDefaultData(): void {
+    const demoMonitors: CreateMonitorInput[] = [
+      {
+        name: 'JSONPlaceholder API',
+        url: 'https://jsonplaceholder.typicode.com/posts/1',
+        method: 'GET',
+        intervalSeconds: 15,
+        timeoutMs: 5000,
+        alertConfig: {
+          consecutiveThreshold: 3,
+          latencyThresholdMs: 800,
+        },
       },
+      {
+        name: 'GitHub Status API',
+        url: 'https://www.githubstatus.com/api/v2/status.json',
+        method: 'GET',
+        intervalSeconds: 30,
+        timeoutMs: 4000,
+        alertConfig: {
+          consecutiveThreshold: 2,
+          latencyThresholdMs: 500,
+        },
+      },
+    ];
+
+    for (const item of demoMonitors) {
+      this.createMonitor(item);
+    }
+  }
+
+  public getAllMonitors(): Monitor[] {
+    return Array.from(this.monitors.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+  }
+
+  public getMonitorById(id: string): Monitor | undefined {
+    return this.monitors.get(id);
+  }
+
+  public createMonitor(input: CreateMonitorInput): Monitor {
+    const now = new Date().toISOString();
+    const id = crypto.randomUUID();
+
+    const monitor: Monitor = {
+      id,
+      name: input.name,
+      url: input.url,
+      method: input.method || 'GET',
+      headers: input.headers,
+      body: input.body,
+      intervalSeconds: input.intervalSeconds ?? 30,
+      timeoutMs: input.timeoutMs ?? 5000,
+      status: 'pending',
+      consecutiveFailures: 0,
+      consecutiveSuccesses: 0,
+      uptimePercent: 100,
+      totalChecks: 0,
+      successfulChecks: 0,
+      alertConfig: {
+        consecutiveThreshold: input.alertConfig?.consecutiveThreshold ?? 3,
+        latencyThresholdMs: input.alertConfig?.latencyThresholdMs,
+        notifyEmail: input.alertConfig?.notifyEmail,
+        notifyWebhook: input.alertConfig?.notifyWebhook,
+      },
+      createdAt: now,
+      updatedAt: now,
     };
+
+    this.monitors.set(id, monitor);
+    this.probeResults.set(id, []);
+    return monitor;
   }
 
-  public getAllMonitorsStats(durationMs?: number): Record<string, MonitorAggregateStats> {
-    const result: Record<string, MonitorAggregateStats> = {};
-    for (const monitorId of this.buffers.keys()) {
-      result[monitorId] = this.getStats(monitorId, durationMs);
+  public updateMonitor(id: string, input: UpdateMonitorInput): Monitor | undefined {
+    const existing = this.monitors.get(id);
+    if (!existing) {
+      return undefined;
     }
-    return result;
+
+    const updatedAlertConfig: AlertConfig = {
+      ...existing.alertConfig,
+      ...(input.alertConfig || {}),
+      consecutiveThreshold:
+        input.alertConfig?.consecutiveThreshold ?? existing.alertConfig.consecutiveThreshold,
+    };
+
+    const updated: Monitor = {
+      ...existing,
+      name: input.name ?? existing.name,
+      url: input.url ?? existing.url,
+      method: input.method ?? existing.method,
+      headers: input.headers !== undefined ? input.headers : existing.headers,
+      body: input.body !== undefined ? input.body : existing.body,
+      intervalSeconds: input.intervalSeconds ?? existing.intervalSeconds,
+      timeoutMs: input.timeoutMs ?? existing.timeoutMs,
+      alertConfig: updatedAlertConfig,
+      updatedAt: new Date().toISOString(),
+    };
+
+    this.monitors.set(id, updated);
+    return updated;
   }
 
-  public removeMonitor(monitorId: string): boolean {
-    return this.buffers.delete(monitorId);
-  }
-
-  public clearAll(): void {
-    this.buffers.clear();
-  }
-
-  public getTrackedMonitors(): string[] {
-    return Array.from(this.buffers.keys());
-  }
-
-  public flushSync(): void {
-    if (this.isPersisting) {
-      return;
+  public deleteMonitor(id: string): boolean {
+    const exists = this.monitors.has(id);
+    if (!exists) {
+      return false;
     }
-    this.isPersisting = true;
-    try {
-      const data: Record<string, MetricPoint[]> = {};
-      for (const [id, buf] of this.buffers.entries()) {
-        data[id] = buf.toArray();
-      }
 
-      const snapshot: StoreSnapshot = {
-        version: 1,
-        savedAt: Date.now(),
-        data,
-      };
-
-      const dir = path.dirname(this.snapshotFilePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-
-      const tempPath = `${this.snapshotFilePath}.tmp`;
-      fs.writeFileSync(tempPath, JSON.stringify(snapshot), 'utf8');
-      fs.renameSync(tempPath, this.snapshotFilePath);
-    } catch (err) {
-      console.error('Failed writing snapshot sync:', err);
-    } finally {
-      this.isPersisting = false;
-    }
+    this.monitors.delete(id);
+    this.probeResults.delete(id);
+    this.incidents = this.incidents.filter((incident) => incident.monitorId !== id);
+    return true;
   }
 
-  public async flush(): Promise<void> {
-    if (this.isPersisting) {
-      return;
+  public recordProbeResult(
+    monitorId: string,
+    result: { statusCode: number; latencyMs: number; isUp: boolean; errorMessage?: string }
+  ): { monitor: Monitor; probe: ProbeResult; newIncident?: IncidentEvent } | undefined {
+    const monitor = this.monitors.get(monitorId);
+    if (!monitor) {
+      return undefined;
     }
-    this.isPersisting = true;
-    try {
-      const data: Record<string, MetricPoint[]> = {};
-      for (const [id, buf] of this.buffers.entries()) {
-        data[id] = buf.toArray();
-      }
 
-      const snapshot: StoreSnapshot = {
-        version: 1,
-        savedAt: Date.now(),
-        data,
-      };
+    const now = new Date().toISOString();
+    const probe: ProbeResult = {
+      id: crypto.randomUUID(),
+      monitorId,
+      timestamp: now,
+      statusCode: result.statusCode,
+      latencyMs: result.latencyMs,
+      isUp: result.isUp,
+      errorMessage: result.errorMessage,
+    };
 
-      const dir = path.dirname(this.snapshotFilePath);
-      await fs.promises.mkdir(dir, { recursive: true });
-
-      const tempPath = `${this.snapshotFilePath}.tmp`;
-      await fs.promises.writeFile(tempPath, JSON.stringify(snapshot), 'utf8');
-      await fs.promises.rename(tempPath, this.snapshotFilePath);
-    } catch (err) {
-      console.error('Failed writing snapshot async:', err);
-    } finally {
-      this.isPersisting = false;
+    const results = this.probeResults.get(monitorId) || [];
+    results.push(probe);
+    if (results.length > MAX_PROBES_PER_MONITOR) {
+      results.shift();
     }
-  }
+    this.probeResults.set(monitorId, results);
 
-  private loadSnapshot(): void {
-    try {
-      if (!fs.existsSync(this.snapshotFilePath)) {
-        return;
-      }
-      const raw = fs.readFileSync(this.snapshotFilePath, 'utf8');
-      if (!raw || raw.trim().length === 0) {
-        return;
-      }
-      const parsed = JSON.parse(raw) as StoreSnapshot;
-      if (!parsed || !parsed.data) {
-        return;
-      }
+    const totalChecks = monitor.totalChecks + 1;
+    const successfulChecks = monitor.successfulChecks + (result.isUp ? 1 : 0);
+    const uptimePercent = Number(((successfulChecks / totalChecks) * 100).toFixed(2));
 
-      for (const [monitorId, points] of Object.entries(parsed.data)) {
-        if (!Array.isArray(points)) {
-          continue;
+    let consecutiveFailures = result.isUp ? 0 : monitor.consecutiveFailures + 1;
+    let consecutiveSuccesses = result.isUp ? monitor.consecutiveSuccesses + 1 : 0;
+
+    let status: MonitorStatus = monitor.status;
+    let newIncident: IncidentEvent | undefined;
+
+    const threshold = monitor.alertConfig.consecutiveThreshold || 3;
+    const latencyThreshold = monitor.alertConfig.latencyThresholdMs;
+
+    if (!result.isUp) {
+      if (consecutiveFailures >= threshold) {
+        if (monitor.status !== 'down') {
+          status = 'down';
+          newIncident = {
+            id: crypto.randomUUID(),
+            monitorId: monitor.id,
+            monitorName: monitor.name,
+            type: 'incident_started',
+            message: `Service down: ${consecutiveFailures} consecutive probe failures. Error: ${result.errorMessage || `HTTP ${result.statusCode}`}`,
+            timestamp: now,
+            consecutiveFailures,
+          };
+          this.addIncident(newIncident);
         }
-        const buf = new MetricRingBuffer(this.capacityPerMonitor);
-        for (let i = 0; i < points.length; i++) {
-          buf.push(points[i]);
-        }
-        this.buffers.set(monitorId, buf);
+      } else {
+        status = 'degraded';
       }
-    } catch (err) {
-      console.error('Failed loading metric snapshot, starting fresh:', err);
+    } else {
+      if (monitor.status === 'down') {
+        newIncident = {
+          id: crypto.randomUUID(),
+          monitorId: monitor.id,
+          monitorName: monitor.name,
+          type: 'incident_resolved',
+          message: `Service recovered after outage. Responded with HTTP ${result.statusCode} in ${result.latencyMs}ms.`,
+          timestamp: now,
+          consecutiveFailures: 0,
+          resolvedAt: now,
+        };
+        this.addIncident(newIncident);
+      }
+
+      if (latencyThreshold && result.latencyMs > latencyThreshold) {
+        status = 'degraded';
+        if (monitor.lastLatencyMs && monitor.lastLatencyMs <= latencyThreshold) {
+          const spikeIncident: IncidentEvent = {
+            id: crypto.randomUUID(),
+            monitorId: monitor.id,
+            monitorName: monitor.name,
+            type: 'latency_spike',
+            message: `High latency detected: ${result.latencyMs}ms exceeded threshold of ${latencyThreshold}ms.`,
+            timestamp: now,
+            consecutiveFailures: 0,
+          };
+          this.addIncident(spikeIncident);
+        }
+      } else {
+        status = 'up';
+      }
+    }
+
+    const updatedMonitor: Monitor = {
+      ...monitor,
+      status,
+      consecutiveFailures,
+      consecutiveSuccesses,
+      lastCheckedAt: now,
+      lastLatencyMs: result.latencyMs,
+      totalChecks,
+      successfulChecks,
+      uptimePercent,
+      updatedAt: now,
+    };
+
+    this.monitors.set(monitorId, updatedMonitor);
+    return { monitor: updatedMonitor, probe, newIncident };
+  }
+
+  public getProbeHistory(monitorId: string, limit = 60): ProbeResult[] {
+    const list = this.probeResults.get(monitorId) || [];
+    return list.slice(-limit);
+  }
+
+  public getIncidents(limit = 100): IncidentEvent[] {
+    return this.incidents.slice(0, limit);
+  }
+
+  public getIncidentsByMonitorId(monitorId: string, limit = 50): IncidentEvent[] {
+    return this.incidents
+      .filter((incident) => incident.monitorId === monitorId)
+      .slice(0, limit);
+  }
+
+  private addIncident(incident: IncidentEvent): void {
+    this.incidents.unshift(incident);
+    if (this.incidents.length > MAX_INCIDENT_EVENTS) {
+      this.incidents.pop();
     }
   }
 
-  private startPersistence(): void {
-    if (this.snapshotIntervalMs <= 0) {
-      return;
+  public resetFailureCount(monitorId: string): Monitor | undefined {
+    const monitor = this.monitors.get(monitorId);
+    if (!monitor) {
+      return undefined;
     }
-    this.persistTimer = setInterval(() => {
-      this.flush().catch((err) => {
-        console.error('Metric snapshot periodic error:', err);
-      });
-    }, this.snapshotIntervalMs);
 
-    if (this.persistTimer.unref) {
-      this.persistTimer.unref();
-    }
-  }
+    const updated: Monitor = {
+      ...monitor,
+      consecutiveFailures: 0,
+      updatedAt: new Date().toISOString(),
+    };
 
-  public stop(): void {
-    if (this.persistTimer) {
-      clearInterval(this.persistTimer);
-      this.persistTimer = null;
-    }
-    this.flushSync();
+    this.monitors.set(monitorId, updated);
+    return updated;
   }
 }
 
-export const globalMetricStore = new MetricStore();
-export default globalMetricStore;
+export const store = new Store();
