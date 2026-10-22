@@ -1,212 +1,252 @@
-import dns from 'node:dns/promises';
-import { performance } from 'node:perf_hooks';
-import http from 'node:http';
-import https from 'node:https';
+import http from 'http';
+import https from 'https';
+import { URL } from 'url';
+import { Monitor, ProbeResult } from '../../../shared/types';
+import { store } from './store';
+import { alertManager } from './alertManager';
 
-export interface ProbeTarget {
-  id: string;
-  url: string;
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD' | 'OPTIONS';
-  headers?: Record<string, string>;
-  body?: string;
-  timeoutMs?: number;
-}
-
-export interface ProbeMetrics {
-  targetId: string;
-  url: string;
-  timestamp: number;
-  success: boolean;
-  statusCode?: number;
-  statusText?: string;
-  dnsDurationMs: number;
-  tcpDurationMs: number;
-  tlsDurationMs: number;
-  ttfbDurationMs: number;
-  totalDurationMs: number;
-  responseSizeBytes: number;
-  resolvedIp?: string;
+interface ProbeExecutionOutput {
+  statusCode: number | null;
+  latencyMs: number;
+  isHealthy: boolean;
   errorMessage?: string;
+  responseBodySnippet?: string;
 }
 
-const httpAgent = new http.Agent({ keepAlive: false });
-const httpsAgent = new https.Agent({ keepAlive: false });
+class ProberService {
+  private timers: Map<string, NodeJS.Timeout> = new Map();
+  private inFlight: Set<string> = new Set();
+  private running: boolean = false;
 
-export async function executeProbe(target: ProbeTarget): Promise<ProbeMetrics> {
-  const timeoutMs = target.timeoutMs ?? 10000;
-  const method = target.method ?? 'GET';
-  const timestamp = Date.now();
-  const urlObj = new URL(target.url);
+  public start(): void {
+    if (this.running) return;
+    this.running = true;
 
-  let dnsDurationMs = 0;
-  let resolvedIp: string | undefined;
-
-  const dnsStart = performance.now();
-  try {
-    const lookupResult = await dns.lookup(urlObj.hostname);
-    dnsDurationMs = Math.round((performance.now() - dnsStart) * 100) / 100;
-    resolvedIp = lookupResult.address;
-  } catch (err: unknown) {
-    dnsDurationMs = Math.round((performance.now() - dnsStart) * 100) / 100;
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    return {
-      targetId: target.id,
-      url: target.url,
-      timestamp,
-      success: false,
-      dnsDurationMs,
-      tcpDurationMs: 0,
-      tlsDurationMs: 0,
-      ttfbDurationMs: 0,
-      totalDurationMs: dnsDurationMs,
-      responseSizeBytes: 0,
-      errorMessage: `DNS Lookup Failed: ${errorMessage}`
-    };
+    const monitors = store.getAllMonitors();
+    for (const monitor of monitors) {
+      if (monitor.active) {
+        this.scheduleMonitor(monitor);
+      }
+    }
   }
 
-  const isHttps = urlObj.protocol === 'https:';
-  const requestModule = isHttps ? https : http;
-  const agent = isHttps ? httpsAgent : httpAgent;
+  public stop(): void {
+    this.running = false;
+    for (const [id, timer] of this.timers.entries()) {
+      clearTimeout(timer);
+      this.timers.delete(id);
+    }
+    this.inFlight.clear();
+  }
 
-  return new Promise<ProbeMetrics>((resolve) => {
-    let tcpStart = 0;
-    let tcpDurationMs = 0;
-    let tlsStart = 0;
-    let tlsDurationMs = 0;
-    let ttfbDurationMs = 0;
-    let totalDurationMs = 0;
-    let responseSizeBytes = 0;
-    let isSettled = false;
+  public registerMonitor(monitor: Monitor): void {
+    this.unregisterMonitor(monitor.id);
+    if (this.running && monitor.active) {
+      this.scheduleMonitor(monitor);
+    }
+  }
 
-    const requestStart = performance.now();
+  public unregisterMonitor(monitorId: string): void {
+    const timer = this.timers.get(monitorId);
+    if (timer) {
+      clearTimeout(timer);
+      this.timers.delete(monitorId);
+    }
+    this.inFlight.delete(monitorId);
+  }
 
-    const finish = (metrics: ProbeMetrics) => {
-      if (!isSettled) {
-        isSettled = true;
-        resolve(metrics);
+  public triggerImmediateProbe(monitorId: string): Promise<ProbeResult | null> {
+    const monitor = store.getMonitor(monitorId);
+    if (!monitor) return Promise.resolve(null);
+    return this.executeProbe(monitor);
+  }
+
+  private scheduleMonitor(monitor: Monitor): void {
+    const intervalMs = Math.max(1000, monitor.intervalSeconds * 1000);
+
+    const runCycle = async () => {
+      if (!this.running) return;
+
+      const currentMonitor = store.getMonitor(monitor.id);
+      if (!currentMonitor || !currentMonitor.active) {
+        this.unregisterMonitor(monitor.id);
+        return;
+      }
+
+      await this.executeProbe(currentMonitor);
+
+      if (this.running) {
+        const nextTimer = setTimeout(runCycle, intervalMs);
+        this.timers.set(monitor.id, nextTimer);
       }
     };
 
-    const reqOptions: http.RequestOptions = {
-      protocol: urlObj.protocol,
-      hostname: resolvedIp,
-      port: urlObj.port || (isHttps ? 443 : 80),
-      path: `${urlObj.pathname}${urlObj.search}`,
-      method,
-      headers: {
-        ...target.headers,
-        Host: urlObj.host
-      },
-      agent,
-      timeout: timeoutMs
+    const initialDelay = Math.floor(Math.random() * Math.min(2000, intervalMs));
+    const timer = setTimeout(runCycle, initialDelay);
+    this.timers.set(monitor.id, timer);
+  }
+
+  private async executeProbe(monitor: Monitor): Promise<ProbeResult> {
+    if (this.inFlight.has(monitor.id)) {
+      const activeMonitor = store.getMonitor(monitor.id) || monitor;
+      return {
+        id: `skip_${Date.now()}`,
+        monitorId: monitor.id,
+        timestamp: Date.now(),
+        statusCode: null,
+        latencyMs: 0,
+        isHealthy: false,
+        errorMessage: 'Probe skipped: prior probe still in flight',
+      };
+    }
+
+    this.inFlight.add(monitor.id);
+    const probeStartTime = Date.now();
+
+    let output: ProbeExecutionOutput;
+    try {
+      output = await this.performHttpProbe(monitor);
+    } catch (err: unknown) {
+      const error = err as Error;
+      output = {
+        statusCode: null,
+        latencyMs: Date.now() - probeStartTime,
+        isHealthy: false,
+        errorMessage: error.message || 'Unknown network error',
+      };
+    } finally {
+      this.inFlight.delete(monitor.id);
+    }
+
+    const probeResult: ProbeResult = {
+      id: `probe_${monitor.id}_${probeStartTime}`,
+      monitorId: monitor.id,
+      timestamp: probeStartTime,
+      statusCode: output.statusCode,
+      latencyMs: output.latencyMs,
+      isHealthy: output.isHealthy,
+      errorMessage: output.errorMessage,
+      responseBodySnippet: output.responseBodySnippet,
     };
 
-    if (isHttps) {
-      (reqOptions as https.RequestOptions).servername = urlObj.hostname;
+    store.recordProbeResult(monitor.id, probeResult);
+
+    const latestMonitorState = store.getMonitor(monitor.id);
+    if (latestMonitorState) {
+      alertManager.evaluateProbe(latestMonitorState, probeResult);
     }
 
-    const req = requestModule.request(reqOptions);
+    return probeResult;
+  }
 
-    req.on('socket', (socket) => {
-      tcpStart = performance.now();
-
-      socket.on('connect', () => {
-        tcpDurationMs = Math.round((performance.now() - tcpStart) * 100) / 100;
-      });
-
-      if (isHttps) {
-        tlsStart = performance.now();
-        socket.on('secureConnect', () => {
-          tlsDurationMs = Math.round((performance.now() - tlsStart) * 100) / 100;
+  private performHttpProbe(monitor: Monitor): Promise<ProbeExecutionOutput> {
+    return new Promise((resolve) => {
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(monitor.url);
+      } catch (err) {
+        resolve({
+          statusCode: null,
+          latencyMs: 0,
+          isHealthy: false,
+          errorMessage: 'Invalid monitor URL format',
         });
+        return;
       }
-    });
 
-    req.on('response', (res) => {
-      const ttfbEnd = performance.now();
-      ttfbDurationMs = Math.round((ttfbEnd - requestStart) * 100) / 100;
+      const isHttps = parsedUrl.protocol === 'https:';
+      const lib = isHttps ? https : http;
+      const timeoutMs = (monitor.timeoutSeconds || 10) * 1000;
+      const startTime = process.hrtime.bigint();
 
-      res.on('data', (chunk: Buffer) => {
-        responseSizeBytes += chunk.length;
-      });
+      const requestOptions: https.RequestOptions = {
+        protocol: parsedUrl.protocol,
+        hostname: parsedUrl.hostname,
+        port: parsedUrl.port || (isHttps ? 443 : 80),
+        path: `${parsedUrl.pathname}${parsedUrl.search}`,
+        method: monitor.method || 'GET',
+        headers: {
+          'User-Agent': 'PulseLog-Synthetic-Prober/1.0',
+          Accept: '*/*',
+          ...(monitor.headers || {}),
+        },
+        timeout: timeoutMs,
+      };
 
-      res.on('end', () => {
-        const reqEnd = performance.now();
-        totalDurationMs = Math.round((dnsDurationMs + (reqEnd - requestStart)) * 100) / 100;
-        const statusCode = res.statusCode ?? 0;
-        const success = statusCode >= 200 && statusCode < 400;
+      let timerCleaned = false;
+      let reqTimeout: NodeJS.Timeout | null = null;
 
-        finish({
-          targetId: target.id,
-          url: target.url,
-          timestamp,
-          success,
-          statusCode,
-          statusText: res.statusMessage,
-          dnsDurationMs,
-          tcpDurationMs,
-          tlsDurationMs,
-          ttfbDurationMs,
-          totalDurationMs,
-          responseSizeBytes,
-          resolvedIp
+      const finish = (output: ProbeExecutionOutput) => {
+        if (timerCleaned) return;
+        timerCleaned = true;
+        if (reqTimeout) clearTimeout(reqTimeout);
+        resolve(output);
+      };
+
+      const req = lib.request(requestOptions, (res) => {
+        let bodyBuffer = '';
+        res.setEncoding('utf8');
+
+        res.on('data', (chunk: string) => {
+          if (bodyBuffer.length < 1024) {
+            bodyBuffer += chunk;
+          }
+        });
+
+        res.on('end', () => {
+          const endTime = process.hrtime.bigint();
+          const latencyMs = Number((endTime - startTime) / 1000000n);
+          const statusCode = res.statusCode || null;
+
+          const expectedStatus = monitor.expectedStatusCode || 200;
+          const statusOk = statusCode !== null && statusCode === expectedStatus;
+          const latencyOk = !monitor.latencyThresholdMs || latencyMs <= monitor.latencyThresholdMs;
+          const isHealthy = statusOk && latencyOk;
+
+          let errorMessage: string | undefined;
+          if (!statusOk) {
+            errorMessage = `Expected HTTP ${expectedStatus}, received ${statusCode}`;
+          } else if (!latencyOk) {
+            errorMessage = `Latency ${latencyMs}ms exceeded threshold ${monitor.latencyThresholdMs}ms`;
+          }
+
+          finish({
+            statusCode,
+            latencyMs,
+            isHealthy,
+            errorMessage,
+            responseBodySnippet: bodyBuffer ? bodyBuffer.slice(0, 512) : undefined,
+          });
         });
       });
 
-      res.on('error', (err: Error) => {
-        const reqEnd = performance.now();
-        totalDurationMs = Math.round((dnsDurationMs + (reqEnd - requestStart)) * 100) / 100;
+      req.on('timeout', () => {
+        req.destroy(new Error(`Probe timed out after ${timeoutMs}ms`));
+      });
+
+      req.on('error', (err: Error) => {
+        const endTime = process.hrtime.bigint();
+        const latencyMs = Number((endTime - startTime) / 1000000n);
         finish({
-          targetId: target.id,
-          url: target.url,
-          timestamp,
-          success: false,
-          statusCode: res.statusCode,
-          statusText: res.statusMessage,
-          dnsDurationMs,
-          tcpDurationMs,
-          tlsDurationMs,
-          ttfbDurationMs,
-          totalDurationMs,
-          responseSizeBytes,
-          resolvedIp,
-          errorMessage: `Response Stream Error: ${err.message}`
+          statusCode: null,
+          latencyMs,
+          isHealthy: false,
+          errorMessage: err.message || 'Network socket error',
         });
       });
+
+      if (monitor.body && (monitor.method === 'POST' || monitor.method === 'PUT' || monitor.method === 'PATCH')) {
+        req.write(monitor.body);
+      }
+
+      req.end();
+
+      reqTimeout = setTimeout(() => {
+        req.destroy(new Error(`Probe hard timeout exceeded ${timeoutMs}ms`));
+      }, timeoutMs + 1000);
     });
-
-    req.on('timeout', () => {
-      req.destroy(new Error(`Probe timed out after ${timeoutMs}ms`));
-    });
-
-    req.on('error', (err: Error) => {
-      const reqEnd = performance.now();
-      totalDurationMs = Math.round((dnsDurationMs + (reqEnd - requestStart)) * 100) / 100;
-
-      finish({
-        targetId: target.id,
-        url: target.url,
-        timestamp,
-        success: false,
-        dnsDurationMs,
-        tcpDurationMs,
-        tlsDurationMs,
-        ttfbDurationMs,
-        totalDurationMs,
-        responseSizeBytes: 0,
-        resolvedIp,
-        errorMessage: err.message
-      });
-    });
-
-    if (target.body && ['POST', 'PUT', 'PATCH'].includes(method)) {
-      req.write(target.body);
-    }
-
-    req.end();
-  });
+  }
 }
 
-export async function runProbes(targets: ProbeTarget[]): Promise<ProbeMetrics[]> {
-  return Promise.all(targets.map((target) => executeProbe(target)));
-}
+export const prober = new ProberService();
+export default prober;
