@@ -1,226 +1,183 @@
-# PulseLog - Real-Time API Health Monitor & Synthetic Prober
+# PulseLog
 
-Full-stack observability system. Schedule HTTP synthetic health probes, track response latency percentiles (p50, p90, p99), trigger alerting thresholds, render live status pages.
+Real-Time API Health Monitor & Synthetic Prober. Probe endpoints, calculate p50/p90/p99 latency metrics, trigger automated alert webhooks, track incident timelines.
 
 ## Architecture
 
-```
-+-------------------------------------------------------------+
-|                      Client (React + Vite)                  |
-|  - LatencyChart (Recharts / Canvas latency distribution)    |
-|  - MonitorCard (Per-target health status, SLA, jitter)      |
-|  - Polling / Event synchronization                          |
-+------------------------------+------------------------------+
-                               |
-                        HTTP / REST API
-                               |
-+------------------------------v------------------------------+
-|                 Server Engine (Node.js + Express)           |
-|                                                             |
-|  +------------------------+     +------------------------+  |
-|  | routes/monitors.ts     |     | services/prober.ts     |  |
-|  | - Monitor CRUD         |     | - Interval scheduler   |  |
-|  | - Metric aggregations  |     | - HTTP probe runner    |  |
-|  | - Incident reports     |     | - Latency calculator   |  |
-|  +-----------+------------+     +-----------+------------+  |
-|              |                              |               |
-|              +--------------+---------------+               |
-|                             |                               |
-|              +--------------v---------------+               |
-|              | services/store.ts            |               |
-|              | - In-memory / persistent log |               |
-|              | - Percentile sliding window  |               |
-|              +------------------------------+               |
-+-------------------------------------------------------------+
-                               |
-                       Network Probes
-                               |
-+------------------------------v------------------------------+
-|               Target External Endpoints / APIs              |
-+-------------------------------------------------------------+
-```
+- Client: React 18, Vite, Tailwind CSS, Recharts, Lucide Icons.
+- Server: Node.js, Express, TypeScript, Server-Sent Events (SSE).
+- Storage: In-memory store with periodic snapshotting / persistence layer.
+- Prober: Node HTTP/HTTPS agent with synthetic cron timers and rolling window latency buffer.
 
-## Directory Structure
-
-```
-.
-├── client/                 # React frontend (Vite, Tailwind CSS, TypeScript)
-│   ├── src/
-│   │   ├── components/     # UI widgets: LatencyChart, MonitorCard
-│   │   ├── App.tsx         # Main dashboard view
-│   │   └── index.css       # Tailwind utility classes
-│   └── vite.config.ts      # Vite bundler configuration
-├── server/                 # Express API server (Node.js, TypeScript)
-│   ├── src/
-│   │   ├── routes/         # API endpoints (monitors.ts)
-│   │   ├── services/       # Core probe scheduler (prober.ts) & state (store.ts)
-│   │   └── index.ts        # Entry point and HTTP listener
-│   └── tsconfig.json       # Node TypeScript compilation config
-├── shared/                 # Shared TypeScript models and interfaces
-│   └── types.ts            # Probe result, monitor, metric type definitions
-├── package.json            # Root workspace config (npm workspaces)
-└── tsconfig.base.json      # Shared compiler options
-```
-
-## Local Development Runbook
-
-### Prerequisites
-
-- Node.js >= 18.0.0
-- npm >= 9.0.0
-
-### Installation
-
-Install root and workspace dependencies:
+## Quickstart
 
 ```bash
 npm install
-```
-
-### Run Locally
-
-Run both server (port 3001) and client (port 5173) concurrently:
-
-```bash
+npm run build
 npm run dev
 ```
 
-Run server only:
+Dashboard runs on `http://localhost:5173`. API server runs on `http://localhost:3000`.
 
-```bash
-npm run dev:server
-```
+---
 
-Run client only:
+## Webhook Alerting
 
-```bash
-npm run dev:client
-```
+PulseLog emits HTTP `POST` requests when monitor states transition between `HEALTHY`, `DEGRADED`, and `DOWN`.
 
-### Build
+### Delivery Headers
 
-Compile shared types, server backend, and Vite frontend production assets:
+| Header | Description |
+| :--- | :--- |
+| `Content-Type` | `application/json` |
+| `User-Agent` | `PulseLog-Webhook-Prober/1.0` |
+| `X-PulseLog-Event` | Event identifier (`incident.triggered`, `incident.resolved`, `incident.escalated`) |
+| `X-PulseLog-Timestamp` | Unix epoch millisecond string |
+| `X-PulseLog-Signature` | Hex-encoded HMAC-SHA256 signature generated over `${timestamp}.${rawBody}` using configured monitor signing secret |
 
-```bash
-npm run build
-```
-
-### Production Execution
-
-Run production backend build:
-
-```bash
-npm run start
-```
-
-## API Documentation
-
-Base URL: `http://localhost:3001/api`
-
-### 1. List Monitors
-
-Retrieve all registered synthetic probers and recent metrics.
-
-- **URL:** `/monitors`
-- **Method:** `GET`
-- **Response Code:** `200 OK`
-- **Response Body:**
+### Payload Schema
 
 ```json
-[
-  {
-    "id": "mon_xyz123",
-    "name": "Payments Gateway Probe",
-    "url": "https://api.stripe.com/healthcheck",
-    "intervalMs": 10000,
+{
+  "eventId": "evt_01HZX87K4N8M1W2E3R4T5Y6U7I",
+  "eventType": "incident.triggered",
+  "timestamp": 1718020800000,
+  "monitor": {
+    "id": "mon_core_auth_api",
+    "name": "Auth Service Probe",
+    "targetUrl": "https://auth.internal.domain/v1/health",
+    "intervalSeconds": 10,
     "timeoutMs": 3000,
-    "status": "UP",
-    "lastChecked": "2025-01-15T10:00:00.000Z",
-    "metrics": {
-      "p50": 42.5,
-      "p90": 85.2,
-      "p99": 140.0,
-      "uptimePercent": 99.98
+    "thresholds": {
+      "consecutiveFailures": 3,
+      "latencyP95DegradedMs": 450,
+      "latencyP99DownMs": 1200
+    }
+  },
+  "incident": {
+    "id": "inc_99ABC123XYZ",
+    "status": "OPEN",
+    "severity": "CRITICAL",
+    "startedAt": 1718020780000,
+    "resolvedAt": null,
+    "reason": "Synthetic probe failed with HTTP 503 Service Unavailable for 3 consecutive attempts.",
+    "metricsSnapshot": {
+      "httpStatus": 503,
+      "latencyMs": 3120,
+      "p50Ms": 240,
+      "p90Ms": 890,
+      "p99Ms": 3120,
+      "packetLossPercent": 33.3
     }
   }
-]
-```
-
-### 2. Create Monitor
-
-Register new synthetic probe target.
-
-- **URL:** `/monitors`
-- **Method:** `POST`
-- **Headers:** `Content-Type: application/json`
-- **Request Body:**
-
-```json
-{
-  "name": "Auth Service",
-  "url": "https://auth.internal.net/health",
-  "intervalMs": 15000,
-  "timeoutMs": 2000,
-  "expectedStatus": 200
 }
 ```
 
-- **Response Code:** `201 Created`
-- **Response Body:**
+---
 
-```json
-{
-  "id": "mon_abc789",
-  "name": "Auth Service",
-  "url": "https://auth.internal.net/health",
-  "intervalMs": 15000,
-  "timeoutMs": 2000,
-  "expectedStatus": 200,
-  "status": "PENDING",
-  "createdAt": "2025-01-15T10:05:00.000Z"
+## HMAC Signature Verification
+
+PulseLog calculates HMAC-SHA256 over canonical string `${timestamp}.${rawJsonBody}`. Always use raw bytes before JSON parse. Do not re-serialize parsed objects; property order change breaks hash verification.
+
+### Node.js (Express) Verification Example
+
+```typescript
+import crypto from 'node:crypto';
+import express, { Request, Response, NextFunction } from 'express';
+
+const app = express();
+const WEBHOOK_SECRET = process.env.PULSELOG_WEBHOOK_SECRET || 'your-signing-secret';
+
+// Capture raw body buffer for verification
+app.use(
+  express.json({
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
+
+function verifyPulseLogSignature(req: Request, res: Response, next: NextFunction) {
+  const signatureHeader = req.header('X-PulseLog-Signature');
+  const timestampHeader = req.header('X-PulseLog-Timestamp');
+
+  if (!signatureHeader || !timestampHeader) {
+    return res.status(401).json({ error: 'Missing security headers' });
+  }
+
+  // Prevent replay attacks (reject payloads older than 5 minutes)
+  const webhookTime = parseInt(timestampHeader, 10);
+  const currentTime = Date.now();
+  if (Number.isNaN(webhookTime) || Math.abs(currentTime - webhookTime) > 300_000) {
+    return res.status(401).json({ error: 'Webhook timestamp expired or invalid' });
+  }
+
+  const rawBody = (req as any).rawBody as Buffer;
+  const canonicalPayload = `${timestampHeader}.${rawBody.toString('utf8')}`;
+
+  const expectedSignature = crypto
+    .createHmac('sha256', WEBHOOK_SECRET)
+    .update(canonicalPayload, 'utf8')
+    .digest('hex');
+
+  const signatureBuffer = Buffer.from(signatureHeader, 'hex');
+  const expectedBuffer = Buffer.from(expectedSignature, 'hex');
+
+  if (
+    signatureBuffer.length !== expectedBuffer.length ||
+    !crypto.timingSafeEqual(signatureBuffer, expectedBuffer)
+  ) {
+    return res.status(401).json({ error: 'Invalid HMAC signature' });
+  }
+
+  return next();
 }
+
+app.post('/api/webhooks/pulselog', verifyPulseLogSignature, (req: Request, res: Response) => {
+  const { eventType, monitor, incident } = req.body;
+
+  console.log(`[PulseLog] Received valid event: ${eventType} for ${monitor.name}`);
+  console.log(`Incident ID: ${incident.id}, Severity: ${incident.severity}`);
+
+  res.status(200).json({ received: true });
+});
+
+app.listen(8080, () => console.log('Receiver running on port 8080'));
 ```
 
-### 3. Get Monitor Details
+---
 
-Fetch specific probe state and full history ring buffer.
+## Incident Retention & Eviction Policy
 
-- **URL:** `/monitors/:id`
-- **Method:** `GET`
-- **Response Code:** `200 OK` | `404 Not Found`
-- **Response Body:**
+PulseLog keeps incident and probe time-series data bounded in memory to prevent heap leak.
 
-```json
+### Eviction Rules
+
+1. **Active Incidents (`status: "OPEN"`):**
+   - Retained permanently in active memory until recovery probe triggers resolution.
+   - Never evicted during active degradation.
+
+2. **Resolved Incidents (`status: "RESOLVED"`):**
+   - Maximum retention duration: **30 days** (`RETENTION_DAYS=30`).
+   - Hard cap ceiling: **1,000 incident records** per monitor (`MAX_INCIDENTS_PER_MONITOR=1000`).
+   - Buffer overflow policy: Oldest resolved incident dropped first (FIFO) when hard limit reached.
+
+3. **Raw Probe Samples:**
+   - Kept in sliding circular ring buffer.
+   - Default capacity: **2,880 samples** per monitor (equivalent to 24 hours at 30-second interval).
+   - Downsampled hourly into p50/p90/p99 aggregates before drop.
+
+### Manual Cleanup Endpoint
+
+Force clean stale historical items via maintenance route:
+
+```bash
+POST /api/v1/maintenance/cleanup
+Content-Type: application/json
+Authorization: Bearer <ADMIN_API_KEY>
+
 {
-  "id": "mon_abc789",
-  "name": "Auth Service",
-  "url": "https://auth.internal.net/health",
-  "intervalMs": 15000,
-  "timeoutMs": 2000,
-  "status": "UP",
-  "history": [
-    {
-      "timestamp": "2025-01-15T10:05:15.000Z",
-      "statusCode": 200,
-      "latencyMs": 31.4,
-      "ok": true
-    }
-  ]
+  "olderThanDays": 14,
+  "purgeResolvedOnly": true
 }
 ```
-
-### 4. Delete Monitor
-
-Deregister synthetic probe and cancel internal polling timer.
-
-- **URL:** `/monitors/:id`
-- **Method:** `DELETE`
-- **Response Code:** `204 No Content` | `404 Not Found`
-
-## Environment Variables
-
-| Variable | Target | Description | Default |
-| :--- | :--- | :--- | :--- |
-| `PORT` | server | HTTP port for server listener | `3001` |
-| `NODE_ENV` | server | Runtime environment (`development`/`production`) | `development` |
-| `VITE_API_URL` | client | Express server backend origin | `http://localhost:3001` |
