@@ -1,447 +1,399 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import MonitorCard from './components/MonitorCard';
-import LatencyChart from './components/LatencyChart';
-import { Monitor, CreateMonitorInput, ProbeResult } from '../../shared/types';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { MonitorCard } from './components/MonitorCard';
+import { IncidentHistory } from './components/IncidentHistory';
+import { LatencyChart } from './components/LatencyChart';
+import { AlertConfigModal } from './components/AlertConfigModal';
+import { Monitor, Incident, AlertConfig, ProbeResult } from '../../shared/types';
 
-const API_BASE = '/api/monitors';
-const POLLING_INTERVAL = 3000;
-
-interface MonitorHistoryMap {
-  [monitorId: string]: ProbeResult[];
-}
-
-export default function App() {
+export const App: React.FC = () => {
   const [monitors, setMonitors] = useState<Monitor[]>([]);
-  const [history, setHistory] = useState<MonitorHistoryMap>({});
+  const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [probeResults, setProbeResults] = useState<Record<string, ProbeResult[]>>({});
   const [selectedMonitorId, setSelectedMonitorId] = useState<string | null>(null);
-  const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [editingAlertMonitor, setEditingAlertMonitor] = useState<Monitor | null>(null);
+  const [isCreating, setIsCreating] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Form State
-  const [name, setName] = useState('');
-  const [url, setUrl] = useState('');
-  const [method, setMethod] = useState<'GET' | 'POST' | 'PUT' | 'DELETE' | 'HEAD'>('GET');
-  const [interval, setIntervalVal] = useState<number>(10);
-  const [expectedStatus, setExpectedStatus] = useState<number>(200);
-  const [latencyThreshold, setLatencyThreshold] = useState<number>(500);
-  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [newMonitor, setNewMonitor] = useState({
+    name: '',
+    url: '',
+    interval: 10,
+    timeout: 5000,
+    expectedStatus: 200,
+  });
+
+  const failureDetectedRef = useRef(false);
+
+  const fetchIncidents = useCallback(async () => {
+    try {
+      const res = await fetch('/api/incidents');
+      if (!res.ok) throw new Error('Fetch incidents fail');
+      const data: Incident[] = await res.json();
+      setIncidents(data);
+    } catch (err: unknown) {
+      console.error(err);
+    }
+  }, []);
+
+  const fetchProbeResults = useCallback(async (monitorId: string) => {
+    try {
+      const res = await fetch(`/api/monitors/${monitorId}/probes`);
+      if (!res.ok) return;
+      const data: ProbeResult[] = await res.json();
+      setProbeResults((prev) => ({ ...prev, [monitorId]: data }));
+    } catch (err: unknown) {
+      console.error(err);
+    }
+  }, []);
 
   const fetchMonitors = useCallback(async () => {
     try {
-      const res = await fetch(API_BASE);
-      if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to fetch monitors`);
+      const res = await fetch('/api/monitors');
+      if (!res.ok) throw new Error('Fetch monitors fail');
       const data: Monitor[] = await res.json();
       setMonitors(data);
 
-      if (data.length > 0 && !selectedMonitorId) {
+      const hasDown = data.some((m) => m.status === 'down');
+      failureDetectedRef.current = hasDown;
+
+      if (hasDown) {
+        await fetchIncidents();
+      }
+
+      data.forEach((m) => {
+        fetchProbeResults(m.id);
+      });
+
+      if (!selectedMonitorId && data.length > 0) {
         setSelectedMonitorId(data[0].id);
       }
       setError(null);
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Unknown network error';
-      setError(message);
+      setError(err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setLoading(false);
     }
-  }, [selectedMonitorId]);
-
-  const fetchHistory = useCallback(async (monitorId: string) => {
-    try {
-      const res = await fetch(`${API_BASE}/${monitorId}/history`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to fetch history`);
-      const data: ProbeResult[] = await res.json();
-      setHistory((prev) => ({ ...prev, [monitorId]: data }));
-    } catch (err: unknown) {
-      console.error(`Failed to get history for ${monitorId}:`, err);
-    }
-  }, []);
+  }, [fetchIncidents, fetchProbeResults, selectedMonitorId]);
 
   useEffect(() => {
     fetchMonitors();
-    const intervalId = setInterval(() => {
-      fetchMonitors();
-    }, POLLING_INTERVAL);
-    return () => clearInterval(intervalId);
-  }, [fetchMonitors]);
+    fetchIncidents();
+
+    const monitorInterval = setInterval(fetchMonitors, 5000);
+    return () => clearInterval(monitorInterval);
+  }, [fetchMonitors, fetchIncidents]);
 
   useEffect(() => {
-    if (selectedMonitorId) {
-      fetchHistory(selectedMonitorId);
-      const historyIntervalId = setInterval(() => {
-        fetchHistory(selectedMonitorId);
-      }, POLLING_INTERVAL);
-      return () => clearInterval(historyIntervalId);
+    let incidentInterval: NodeJS.Timeout | null = null;
+    if (failureDetectedRef.current) {
+      incidentInterval = setInterval(fetchIncidents, 3000);
     }
-  }, [selectedMonitorId, fetchHistory]);
-
-  const handleCreateTarget = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsSubmitting(true);
-    setError(null);
-
-    const payload: CreateMonitorInput = {
-      name,
-      url,
-      method,
-      interval: Number(interval),
-      expectedStatus: Number(expectedStatus),
-      latencyThreshold: Number(latencyThreshold)
+    return () => {
+      if (incidentInterval) clearInterval(incidentInterval);
     };
+  }, [monitors, fetchIncidents]);
 
+  const handleCreateMonitor = async (e: React.FormEvent) => {
+    e.preventDefault();
     try {
-      const res = await fetch(API_BASE, {
+      const res = await fetch('/api/monitors', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({
+          ...newMonitor,
+          interval: Number(newMonitor.interval),
+          timeout: Number(newMonitor.timeout),
+          expectedStatus: Number(newMonitor.expectedStatus),
+        }),
       });
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.message || `HTTP ${res.status}: Failed to create monitor`);
-      }
-      const newMonitor: Monitor = await res.json();
-      setMonitors((prev) => [newMonitor, ...prev]);
-      setSelectedMonitorId(newMonitor.id);
-      setIsModalOpen(false);
-
-      // Reset form
-      setName('');
-      setUrl('');
-      setMethod('GET');
-      setIntervalVal(10);
-      setExpectedStatus(200);
-      setLatencyThreshold(500);
+      if (!res.ok) throw new Error('Create monitor fail');
+      const created: Monitor = await res.json();
+      setMonitors((prev) => [...prev, created]);
+      setIsCreating(false);
+      setNewMonitor({
+        name: '',
+        url: '',
+        interval: 10,
+        timeout: 5000,
+        expectedStatus: 200,
+      });
+      setSelectedMonitorId(created.id);
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Target creation failed';
-      setError(message);
-    } finally {
-      setIsSubmitting(false);
+      alert(err instanceof Error ? err.message : 'Create fail');
     }
   };
 
-  const handleDeleteMonitor = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handleDeleteMonitor = async (id: string) => {
+    if (!confirm('Delete monitor?')) return;
     try {
-      const res = await fetch(`${API_BASE}/${id}`, { method: 'DELETE' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}: Failed to delete monitor`);
+      const res = await fetch(`/api/monitors/${id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Delete fail');
       setMonitors((prev) => prev.filter((m) => m.id !== id));
       if (selectedMonitorId === id) {
-        const remaining = monitors.filter((m) => m.id !== id);
-        setSelectedMonitorId(remaining.length > 0 ? remaining[0].id : null);
+        setSelectedMonitorId(monitors.find((m) => m.id !== id)?.id || null);
       }
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Target deletion failed';
-      setError(message);
+      alert(err instanceof Error ? err.message : 'Delete fail');
     }
   };
 
-  const handleTriggerProbe = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handleUpdateAlertConfig = async (monitorId: string, alertConfig: AlertConfig) => {
     try {
-      const res = await fetch(`${API_BASE}/${id}/probe`, { method: 'POST' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}: Force probe failed`);
-      fetchMonitors();
-      fetchHistory(id);
+      const res = await fetch(`/api/monitors/${monitorId}/alerts`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(alertConfig),
+      });
+      if (!res.ok) throw new Error('Update alert config fail');
+      const updated: Monitor = await res.json();
+      setMonitors((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
+      setEditingAlertMonitor(null);
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Force probe request failed';
-      setError(message);
+      alert(err instanceof Error ? err.message : 'Update alert fail');
     }
   };
 
-  const selectedMonitor = useMemo(
-    () => monitors.find((m) => m.id === selectedMonitorId) || null,
-    [monitors, selectedMonitorId]
-  );
-
-  const selectedHistory = useMemo(
-    () => (selectedMonitorId ? history[selectedMonitorId] || [] : []),
-    [history, selectedMonitorId]
-  );
-
-  const globalStats = useMemo(() => {
-    const total = monitors.length;
-    const up = monitors.filter((m) => m.status === 'UP').length;
-    const down = monitors.filter((m) => m.status === 'DOWN').length;
-    const degraded = monitors.filter((m) => m.status === 'DEGRADED').length;
-    return { total, up, down, degraded };
-  }, [monitors]);
+  const selectedMonitor = monitors.find((m) => m.id === selectedMonitorId) || null;
+  const selectedProbes = selectedMonitorId ? probeResults[selectedMonitorId] || [] : [];
+  const selectedIncidents = selectedMonitorId
+    ? incidents.filter((inc) => inc.monitorId === selectedMonitorId)
+    : incidents;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
-      {/* Top Navigation */}
-      <header className="border-b border-slate-800 bg-slate-900/60 backdrop-blur px-6 py-4 flex items-center justify-between sticky top-0 z-20">
+    <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans">
+      <header className="border-b border-slate-800 bg-slate-950 px-6 py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <div className="h-8 w-8 bg-emerald-500 rounded flex items-center justify-center font-bold text-slate-950 shadow-lg shadow-emerald-500/20">
-            P
-          </div>
-          <div>
-            <h1 className="text-lg font-bold tracking-tight text-white leading-tight">PulseLog</h1>
-            <p className="text-xs text-slate-400">Synthetic Health & Latency Monitor</p>
-          </div>
+          <div className="h-3 w-3 rounded-full bg-emerald-500 animate-pulse" />
+          <h1 className="text-xl font-bold tracking-tight text-white">PulseLog</h1>
+          <span className="text-xs font-mono uppercase bg-slate-800 text-slate-400 px-2 py-0.5 rounded">
+            Observability Engine
+          </span>
         </div>
-        <div className="flex items-center gap-4">
-          <button
-            onClick={() => setIsModalOpen(true)}
-            className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-sm rounded transition cursor-pointer shadow-sm shadow-emerald-500/30"
-          >
-            + Add Target
-          </button>
-        </div>
+        <button
+          onClick={() => setIsCreating(true)}
+          className="bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold px-4 py-2 rounded shadow transition"
+        >
+          Add Monitor
+        </button>
       </header>
 
-      {/* Main Body */}
-      <main className="flex-1 p-6 max-w-7xl w-full mx-auto flex flex-col gap-6">
-        {/* Metric Bar */}
-        <section className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
-            <span className="text-xs text-slate-400 block font-medium">TOTAL PROBES</span>
-            <span className="text-2xl font-bold text-white mt-1 block">{globalStats.total}</span>
-          </div>
-          <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
-            <span className="text-xs text-slate-400 block font-medium">ONLINE (HEALTHY)</span>
-            <span className="text-2xl font-bold text-emerald-400 mt-1 block">{globalStats.up}</span>
-          </div>
-          <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
-            <span className="text-xs text-slate-400 block font-medium">DEGRADED (LATENCY)</span>
-            <span className="text-2xl font-bold text-amber-400 mt-1 block">{globalStats.degraded}</span>
-          </div>
-          <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
-            <span className="text-xs text-slate-400 block font-medium">CRITICAL (DOWN)</span>
-            <span className="text-2xl font-bold text-rose-500 mt-1 block">{globalStats.down}</span>
-          </div>
-        </section>
+      {error && (
+        <div className="bg-rose-950 border-b border-rose-800 text-rose-200 px-6 py-2 text-sm">
+          {error}
+        </div>
+      )}
 
-        {error && (
-          <div className="p-4 bg-rose-500/10 border border-rose-500/30 rounded-lg text-rose-400 text-sm flex justify-between items-center">
-            <span>{error}</span>
-            <button
-              onClick={() => setError(null)}
-              className="text-rose-400 hover:text-rose-200 font-bold ml-4"
-            >
-              x
-            </button>
-          </div>
-        )}
-
-        {/* Dynamic Split Layout */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Target Cards Column */}
-          <div className="lg:col-span-5 flex flex-col gap-4">
-            <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider">Targets</h2>
-            {loading && monitors.length === 0 ? (
-              <div className="bg-slate-900 border border-slate-800 rounded-lg p-8 text-center text-slate-400">
-                Polling initial monitor states...
-              </div>
-            ) : monitors.length === 0 ? (
-              <div className="bg-slate-900 border border-slate-800 rounded-lg p-8 text-center text-slate-500 flex flex-col items-center gap-3">
-                <p>No synthetic probers registered.</p>
-                <button
-                  onClick={() => setIsModalOpen(true)}
-                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm rounded border border-slate-700"
-                >
-                  Configure first target
-                </button>
-              </div>
-            ) : (
-              monitors.map((mon) => (
+      <main className="flex-1 p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 overflow-hidden">
+        <div className="lg:col-span-4 flex flex-col gap-4 overflow-y-auto">
+          <h2 className="text-sm font-semibold uppercase text-slate-400 tracking-wider">
+            Monitors ({monitors.length})
+          </h2>
+          {loading && monitors.length === 0 ? (
+            <div className="text-slate-500 text-sm">Loading monitors...</div>
+          ) : monitors.length === 0 ? (
+            <div className="text-slate-500 text-sm">No monitors configured. Add one.</div>
+          ) : (
+            <div className="flex flex-col gap-3">
+              {monitors.map((m) => (
                 <div
-                  key={mon.id}
-                  onClick={() => setSelectedMonitorId(mon.id)}
-                  className={`cursor-pointer transition rounded-lg border ${
-                    selectedMonitorId === mon.id
-                      ? 'border-emerald-500/60 ring-1 ring-emerald-500/20'
-                      : 'border-slate-800/80 hover:border-slate-700'
+                  key={m.id}
+                  onClick={() => setSelectedMonitorId(m.id)}
+                  className={`cursor-pointer rounded-lg border transition ${
+                    selectedMonitorId === m.id
+                      ? 'border-emerald-500 bg-slate-800/80 shadow-lg ring-1 ring-emerald-500'
+                      : 'border-slate-800 bg-slate-800/40 hover:border-slate-700'
                   }`}
                 >
                   <MonitorCard
-                    monitor={mon}
-                    onDelete={(e) => handleDeleteMonitor(mon.id, e)}
-                    onProbe={(e) => handleTriggerProbe(mon.id, e)}
+                    monitor={m}
+                    onDelete={() => handleDeleteMonitor(m.id)}
+                    onConfigureAlerts={() => setEditingAlertMonitor(m)}
                   />
                 </div>
-              ))
-            )}
-          </div>
+              ))}
+            </div>
+          )}
+        </div>
 
-          {/* Active Target Diagnostics Column */}
-          <div className="lg:col-span-7 flex flex-col gap-4">
-            <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider">Diagnostics</h2>
-            {selectedMonitor ? (
-              <div className="bg-slate-900 border border-slate-800 rounded-lg p-5 flex flex-col gap-6">
-                <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800/80 pb-4">
+        <div className="lg:col-span-8 flex flex-col gap-6 overflow-y-auto">
+          {selectedMonitor ? (
+            <>
+              <div className="bg-slate-800/40 border border-slate-800 rounded-lg p-5">
+                <div className="flex justify-between items-start mb-4">
                   <div>
-                    <h3 className="text-lg font-bold text-white">{selectedMonitor.name}</h3>
-                    <p className="text-xs font-mono text-slate-400 mt-0.5 break-all">
-                      {selectedMonitor.method} {selectedMonitor.url}
-                    </p>
+                    <h2 className="text-lg font-bold text-white">{selectedMonitor.name}</h2>
+                    <p className="text-sm font-mono text-slate-400">{selectedMonitor.url}</p>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex gap-2">
                     <button
-                      onClick={(e) => handleTriggerProbe(selectedMonitor.id, e)}
-                      className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-xs border border-slate-700 font-medium"
+                      onClick={() => setEditingAlertMonitor(selectedMonitor)}
+                      className="text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded text-slate-200 transition"
                     >
-                      Instant Probe
+                      Alert Settings
                     </button>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
-                  <div className="bg-slate-950 p-2.5 rounded border border-slate-800">
-                    <span className="text-slate-500 block">EXPECT STATUS</span>
-                    <span className="text-slate-200 font-semibold">{selectedMonitor.expectedStatus}</span>
-                  </div>
-                  <div className="bg-slate-950 p-2.5 rounded border border-slate-800">
-                    <span className="text-slate-500 block">THRESHOLD</span>
-                    <span className="text-slate-200 font-semibold">{selectedMonitor.latencyThreshold}ms</span>
-                  </div>
-                  <div className="bg-slate-950 p-2.5 rounded border border-slate-800">
-                    <span className="text-slate-500 block">CADENCE</span>
-                    <span className="text-slate-200 font-semibold">{selectedMonitor.interval}s</span>
-                  </div>
-                  <div className="bg-slate-950 p-2.5 rounded border border-slate-800">
-                    <span className="text-slate-500 block">LAST STATUS</span>
-                    <span
-                      className={`font-semibold ${
-                        selectedMonitor.status === 'UP'
-                          ? 'text-emerald-400'
-                          : selectedMonitor.status === 'DEGRADED'
-                          ? 'text-amber-400'
-                          : 'text-rose-400'
-                      }`}
-                    >
+                <div className="grid grid-cols-3 gap-4 mb-4">
+                  <div className="bg-slate-900/60 p-3 rounded border border-slate-800/80">
+                    <span className="text-xs text-slate-500 uppercase font-semibold">Status</span>
+                    <div className="text-lg font-bold mt-1 capitalize flex items-center gap-2">
+                      <span
+                        className={`inline-block w-2 h-2 rounded-full ${
+                          selectedMonitor.status === 'up'
+                            ? 'bg-emerald-400'
+                            : selectedMonitor.status === 'down'
+                            ? 'bg-rose-500'
+                            : 'bg-amber-400'
+                        }`}
+                      />
                       {selectedMonitor.status}
-                    </span>
+                    </div>
+                  </div>
+                  <div className="bg-slate-900/60 p-3 rounded border border-slate-800/80">
+                    <span className="text-xs text-slate-500 uppercase font-semibold">Interval</span>
+                    <div className="text-lg font-bold mt-1 text-slate-200 font-mono">
+                      {selectedMonitor.interval}s
+                    </div>
+                  </div>
+                  <div className="bg-slate-900/60 p-3 rounded border border-slate-800/80">
+                    <span className="text-xs text-slate-500 uppercase font-semibold">P95 Latency</span>
+                    <div className="text-lg font-bold mt-1 text-slate-200 font-mono">
+                      {selectedProbes.length > 0
+                        ? `${Math.round(
+                            selectedProbes
+                              .map((p) => p.latency)
+                              .sort((a, b) => a - b)[
+                              Math.floor(selectedProbes.length * 0.95)
+                            ] || 0
+                          )}ms`
+                        : 'N/A'}
+                    </div>
                   </div>
                 </div>
 
-                {/* Response Chart */}
-                <div className="mt-2">
-                  <h4 className="text-xs font-semibold text-slate-400 mb-3 uppercase tracking-wider">
-                    Response Latency (ms)
-                  </h4>
-                  <LatencyChart history={selectedHistory} threshold={selectedMonitor.latencyThreshold} />
-                </div>
+                <LatencyChart data={selectedProbes} />
               </div>
-            ) : (
-              <div className="bg-slate-900 border border-slate-800 rounded-lg p-12 text-center text-slate-500">
-                Select a configured probe target to inspect telemetry.
+
+              <div className="bg-slate-800/40 border border-slate-800 rounded-lg p-5">
+                <h3 className="text-sm font-semibold uppercase text-slate-400 tracking-wider mb-4">
+                  Incidents ({selectedIncidents.length})
+                </h3>
+                <IncidentHistory incidents={selectedIncidents} />
               </div>
-            )}
-          </div>
+            </>
+          ) : (
+            <div className="h-full flex items-center justify-center text-slate-500 border border-slate-800 rounded-lg">
+              Select monitor to inspect metrics.
+            </div>
+          )}
         </div>
       </main>
 
-      {/* Target Modal */}
-      {isModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-lg max-w-md w-full p-6 shadow-2xl relative">
-            <div className="flex justify-between items-center mb-5 border-b border-slate-800 pb-3">
-              <h3 className="text-base font-semibold text-white">Create Prober Target</h3>
-              <button
-                onClick={() => setIsModalOpen(false)}
-                className="text-slate-400 hover:text-white text-lg font-bold"
-              >
-                ✕
-              </button>
+      {isCreating && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <form
+            onSubmit={handleCreateMonitor}
+            className="bg-slate-900 border border-slate-700 w-full max-w-md rounded-lg p-6 flex flex-col gap-4 shadow-xl"
+          >
+            <h3 className="text-lg font-bold text-white">Create Health Probe</h3>
+            <div>
+              <label className="text-xs font-semibold uppercase text-slate-400 block mb-1">
+                Name
+              </label>
+              <input
+                required
+                type="text"
+                className="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+                value={newMonitor.name}
+                onChange={(e) => setNewMonitor({ ...newMonitor, name: e.target.value })}
+                placeholder="Billing API Health"
+              />
             </div>
-
-            <form onSubmit={handleCreateTarget} className="flex flex-col gap-4">
+            <div>
+              <label className="text-xs font-semibold uppercase text-slate-400 block mb-1">
+                Endpoint URL
+              </label>
+              <input
+                required
+                type="url"
+                className="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+                value={newMonitor.url}
+                onChange={(e) => setNewMonitor({ ...newMonitor, url: e.target.value })}
+                placeholder="https://api.example.com/health"
+              />
+            </div>
+            <div className="grid grid-cols-3 gap-2">
               <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">Target Name</label>
+                <label className="text-xs font-semibold uppercase text-slate-400 block mb-1">
+                  Interval (s)
+                </label>
                 <input
-                  type="text"
                   required
-                  placeholder="Billing Microservice"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500"
+                  type="number"
+                  min="1"
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+                  value={newMonitor.interval}
+                  onChange={(e) => setNewMonitor({ ...newMonitor, interval: Number(e.target.value) })}
                 />
               </div>
-
               <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">Target URL</label>
-                <div className="flex gap-2">
-                  <select
-                    value={method}
-                    onChange={(e) => setMethod(e.target.value as any)}
-                    className="bg-slate-950 border border-slate-800 rounded px-2.5 py-2 text-sm text-slate-100 font-mono focus:outline-none focus:border-emerald-500"
-                  >
-                    <option value="GET">GET</option>
-                    <option value="POST">POST</option>
-                    <option value="PUT">PUT</option>
-                    <option value="DELETE">DELETE</option>
-                    <option value="HEAD">HEAD</option>
-                  </select>
-                  <input
-                    type="url"
-                    required
-                    placeholder="https://api.domain.com/healthz"
-                    value={url}
-                    onChange={(e) => setUrl(e.target.value)}
-                    className="flex-1 bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 font-mono placeholder-slate-600 focus:outline-none focus:border-emerald-500"
-                  />
-                </div>
+                <label className="text-xs font-semibold uppercase text-slate-400 block mb-1">
+                  Timeout (ms)
+                </label>
+                <input
+                  required
+                  type="number"
+                  min="100"
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+                  value={newMonitor.timeout}
+                  onChange={(e) => setNewMonitor({ ...newMonitor, timeout: Number(e.target.value) })}
+                />
               </div>
-
-              <div className="grid grid-cols-3 gap-3">
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">Interval (s)</label>
-                  <input
-                    type="number"
-                    min="1"
-                    max="3600"
-                    required
-                    value={interval}
-                    onChange={(e) => setIntervalVal(Number(e.target.value))}
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 font-mono focus:outline-none focus:border-emerald-500"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">Expect Code</label>
-                  <input
-                    type="number"
-                    min="100"
-                    max="599"
-                    required
-                    value={expectedStatus}
-                    onChange={(e) => setExpectedStatus(Number(e.target.value))}
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 font-mono focus:outline-none focus:border-emerald-500"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">Limit (ms)</label>
-                  <input
-                    type="number"
-                    min="1"
-                    max="60000"
-                    required
-                    value={latencyThreshold}
-                    onChange={(e) => setLatencyThreshold(Number(e.target.value))}
-                    className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-sm text-slate-100 font-mono focus:outline-none focus:border-emerald-500"
-                  />
-                </div>
+              <div>
+                <label className="text-xs font-semibold uppercase text-slate-400 block mb-1">
+                  Status
+                </label>
+                <input
+                  required
+                  type="number"
+                  className="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+                  value={newMonitor.expectedStatus}
+                  onChange={(e) =>
+                    setNewMonitor({ ...newMonitor, expectedStatus: Number(e.target.value) })
+                  }
+                />
               </div>
-
-              <div className="flex justify-end gap-2 mt-4 pt-3 border-t border-slate-800">
-                <button
-                  type="button"
-                  onClick={() => setIsModalOpen(false)}
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-sm transition"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold rounded text-sm transition disabled:opacity-50"
-                >
-                  {isSubmitting ? 'Registering...' : 'Save Target'}
-                </button>
-              </div>
-            </form>
-          </div>
+            </div>
+            <div className="flex justify-end gap-3 mt-4">
+              <button
+                type="button"
+                onClick={() => setIsCreating(false)}
+                className="px-4 py-2 text-sm bg-slate-800 hover:bg-slate-700 text-slate-300 rounded"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 text-sm bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded"
+              >
+                Save
+              </button>
+            </div>
+          </form>
         </div>
+      )}
+
+      {editingAlertMonitor && (
+        <AlertConfigModal
+          monitor={editingAlertMonitor}
+          onClose={() => setEditingAlertMonitor(null)}
+          onSave={(config) => handleUpdateAlertConfig(editingAlertMonitor.id, config)}
+        />
       )}
     </div>
   );
-}
+};
+
+export default App;
