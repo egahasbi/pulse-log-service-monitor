@@ -1,249 +1,281 @@
 import { Router, Request, Response } from 'express';
 import { store } from '../services/store';
 import { prober } from '../services/prober';
-import {
-  CreateMonitorDTO,
-  UpdateMonitorDTO,
-  HttpMethod,
-  MonitorStatus,
-} from '../../../shared/types';
+import { alertManager } from '../services/alertManager';
+import { Monitor, AlertConfig, HttpMethod } from '../../../shared/types';
 
-const router = Router();
+export const monitorsRouter = Router();
 
-const VALID_HTTP_METHODS: HttpMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
+monitorsRouter.get('/', (req: Request, res: Response) => {
+  const monitors = store.getAllMonitors();
+  res.json(monitors);
+});
 
-function validateMonitorPayload(body: any, isUpdate = false): { valid: boolean; error?: string } {
-  if (!isUpdate || body.name !== undefined) {
-    if (typeof body.name !== 'string' || body.name.trim().length === 0) {
-      return { valid: false, error: 'Field "name" must be non-empty string' };
-    }
+monitorsRouter.post('/', (req: Request, res: Response) => {
+  const {
+    name,
+    url,
+    method = 'GET',
+    intervalMs = 30000,
+    timeoutMs = 5000,
+    expectedStatus = 200,
+    headers = {},
+    body,
+    alertConfig,
+  } = req.body;
+
+  if (!name || !url) {
+    res.status(400).json({ error: 'Name and URL are required' });
+    return;
   }
 
-  if (!isUpdate || body.url !== undefined) {
-    if (typeof body.url !== 'string') {
-      return { valid: false, error: 'Field "url" must be string' };
-    }
+  const validMethods: HttpMethod[] = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD'];
+  if (!validMethods.includes(method as HttpMethod)) {
+    res.status(400).json({ error: `Invalid method. Must be one of: ${validMethods.join(', ')}` });
+    return;
+  }
+
+  try {
+    new URL(url);
+  } catch {
+    res.status(400).json({ error: 'Invalid URL format' });
+    return;
+  }
+
+  const defaultAlertConfig: AlertConfig = {
+    webhookUrl: '',
+    emailAddresses: [],
+    failureThreshold: 3,
+    latencyThresholdMs: 2000,
+    enabled: false,
+  };
+
+  const newMonitor = store.createMonitor({
+    name,
+    url,
+    method: method as HttpMethod,
+    intervalMs: Math.max(5000, Number(intervalMs) || 30000),
+    timeoutMs: Math.max(1000, Number(timeoutMs) || 5000),
+    expectedStatus: Number(expectedStatus) || 200,
+    headers,
+    body,
+    alertConfig: alertConfig ? { ...defaultAlertConfig, ...alertConfig } : defaultAlertConfig,
+  });
+
+  prober.scheduleProbe(newMonitor);
+  res.status(201).json(newMonitor);
+});
+
+monitorsRouter.get('/:id', (req: Request, res: Response) => {
+  const monitor = store.getMonitor(req.params.id);
+  if (!monitor) {
+    res.status(404).json({ error: 'Monitor not found' });
+    return;
+  }
+  res.json(monitor);
+});
+
+monitorsRouter.put('/:id', (req: Request, res: Response) => {
+  const existing = store.getMonitor(req.params.id);
+  if (!existing) {
+    res.status(404).json({ error: 'Monitor not found' });
+    return;
+  }
+
+  const {
+    name,
+    url,
+    method,
+    intervalMs,
+    timeoutMs,
+    expectedStatus,
+    headers,
+    body,
+    alertConfig,
+  } = req.body;
+
+  if (url) {
     try {
-      const parsed = new URL(body.url);
-      if (!['http:', 'https:'].includes(parsed.protocol)) {
-        return { valid: false, error: 'Field "url" must use HTTP or HTTPS protocol' };
-      }
+      new URL(url);
     } catch {
-      return { valid: false, error: 'Field "url" must be valid URL' };
+      res.status(400).json({ error: 'Invalid URL format' });
+      return;
     }
   }
 
-  if (body.method !== undefined) {
-    if (!VALID_HTTP_METHODS.includes(body.method)) {
-      return { valid: false, error: `Field "method" must be one of: ${VALID_HTTP_METHODS.join(', ')}` };
-    }
+  const updated = store.updateMonitor(req.params.id, {
+    ...(name !== undefined && { name }),
+    ...(url !== undefined && { url }),
+    ...(method !== undefined && { method }),
+    ...(intervalMs !== undefined && { intervalMs: Math.max(5000, Number(intervalMs)) }),
+    ...(timeoutMs !== undefined && { timeoutMs: Math.max(1000, Number(timeoutMs)) }),
+    ...(expectedStatus !== undefined && { expectedStatus: Number(expectedStatus) }),
+    ...(headers !== undefined && { headers }),
+    ...(body !== undefined && { body }),
+    ...(alertConfig !== undefined && { alertConfig }),
+  });
+
+  if (!updated) {
+    res.status(500).json({ error: 'Failed to update monitor' });
+    return;
   }
 
-  if (body.intervalSeconds !== undefined) {
-    if (typeof body.intervalSeconds !== 'number' || body.intervalSeconds < 5 || body.intervalSeconds > 86400) {
-      return { valid: false, error: 'Field "intervalSeconds" must be number between 5 and 86400' };
-    }
+  prober.rescheduleProbe(updated);
+  res.json(updated);
+});
+
+monitorsRouter.delete('/:id', (req: Request, res: Response) => {
+  const id = req.params.id;
+  const existing = store.getMonitor(id);
+  if (!existing) {
+    res.status(404).json({ error: 'Monitor not found' });
+    return;
   }
 
-  if (body.timeoutMs !== undefined) {
-    if (typeof body.timeoutMs !== 'number' || body.timeoutMs < 500 || body.timeoutMs > 60000) {
-      return { valid: false, error: 'Field "timeoutMs" must be number between 500 and 60000' };
-    }
+  prober.cancelProbe(id);
+  store.deleteMonitor(id);
+  res.status(204).send();
+});
+
+monitorsRouter.post('/:id/probe', async (req: Request, res: Response) => {
+  const monitor = store.getMonitor(req.params.id);
+  if (!monitor) {
+    res.status(404).json({ error: 'Monitor not found' });
+    return;
   }
 
-  if (body.expectedStatusCode !== undefined) {
-    if (
-      typeof body.expectedStatusCode !== 'number' ||
-      body.expectedStatusCode < 100 ||
-      body.expectedStatusCode > 599
-    ) {
-      return { valid: false, error: 'Field "expectedStatusCode" must be valid HTTP status code (100-599)' };
-    }
-  }
-
-  if (body.headers !== undefined && (typeof body.headers !== 'object' || body.headers === null || Array.isArray(body.headers))) {
-    return { valid: false, error: 'Field "headers" must be key-value object' };
-  }
-
-  if (body.body !== undefined && typeof body.body !== 'string' && typeof body.body !== 'object') {
-    return { valid: false, error: 'Field "body" must be string or JSON object' };
-  }
-
-  if (body.latencyThresholdMs !== undefined) {
-    if (typeof body.latencyThresholdMs !== 'number' || body.latencyThresholdMs <= 0) {
-      return { valid: false, error: 'Field "latencyThresholdMs" must be positive number' };
-    }
-  }
-
-  if (body.isActive !== undefined && typeof body.isActive !== 'boolean') {
-    return { valid: false, error: 'Field "isActive" must be boolean' };
-  }
-
-  return { valid: true };
-}
-
-router.get('/', async (_req: Request, res: Response) => {
   try {
-    const monitors = await store.getMonitors();
-    return res.status(200).json(monitors);
-  } catch (err: any) {
-    return res.status(500).json({ error: 'Failed fetch monitors', details: err.message });
+    const result = await prober.executeImmediateProbe(monitor);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Probe execution failed' });
   }
 });
 
-router.get('/:id', async (req: Request, res: Response) => {
-  try {
-    const monitor = await store.getMonitorById(req.params.id);
-    if (!monitor) {
-      return res.status(404).json({ error: 'Monitor not found' });
+monitorsRouter.get('/:id/checks', (req: Request, res: Response) => {
+  const monitor = store.getMonitor(req.params.id);
+  if (!monitor) {
+    res.status(404).json({ error: 'Monitor not found' });
+    return;
+  }
+
+  const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 100;
+  const checks = store.getChecks(req.params.id, Math.min(limit, 1000));
+  res.json(checks);
+});
+
+monitorsRouter.get('/:id/stats', (req: Request, res: Response) => {
+  const monitor = store.getMonitor(req.params.id);
+  if (!monitor) {
+    res.status(404).json({ error: 'Monitor not found' });
+    return;
+  }
+
+  const range = (req.query.range as string) || '24h';
+  const stats = store.getStats(req.params.id, range);
+  res.json(stats);
+});
+
+monitorsRouter.post('/:id/alerts', (req: Request, res: Response) => {
+  const monitor = store.getMonitor(req.params.id);
+  if (!monitor) {
+    res.status(404).json({ error: 'Monitor not found' });
+    return;
+  }
+
+  const {
+    webhookUrl,
+    emailAddresses,
+    failureThreshold,
+    latencyThresholdMs,
+    enabled,
+  } = req.body;
+
+  if (webhookUrl !== undefined && webhookUrl !== '') {
+    try {
+      new URL(webhookUrl);
+    } catch {
+      res.status(400).json({ error: 'Invalid webhookUrl format' });
+      return;
     }
-    return res.status(200).json(monitor);
-  } catch (err: any) {
-    return res.status(500).json({ error: 'Failed fetch monitor', details: err.message });
+  }
+
+  if (emailAddresses !== undefined && !Array.isArray(emailAddresses)) {
+    res.status(400).json({ error: 'emailAddresses must be an array of strings' });
+    return;
+  }
+
+  const currentAlertConfig = monitor.alertConfig || {
+    webhookUrl: '',
+    emailAddresses: [],
+    failureThreshold: 3,
+    latencyThresholdMs: 2000,
+    enabled: false,
+  };
+
+  const updatedAlertConfig: AlertConfig = {
+    webhookUrl: webhookUrl !== undefined ? webhookUrl : currentAlertConfig.webhookUrl,
+    emailAddresses: emailAddresses !== undefined ? emailAddresses : currentAlertConfig.emailAddresses,
+    failureThreshold: failureThreshold !== undefined ? Math.max(1, Number(failureThreshold)) : currentAlertConfig.failureThreshold,
+    latencyThresholdMs: latencyThresholdMs !== undefined ? Math.max(50, Number(latencyThresholdMs)) : currentAlertConfig.latencyThresholdMs,
+    enabled: enabled !== undefined ? Boolean(enabled) : currentAlertConfig.enabled,
+  };
+
+  const updatedMonitor = store.updateMonitor(req.params.id, {
+    alertConfig: updatedAlertConfig,
+  });
+
+  if (!updatedMonitor) {
+    res.status(500).json({ error: 'Failed to update monitor alert configuration' });
+    return;
+  }
+
+  res.json(updatedMonitor.alertConfig);
+});
+
+monitorsRouter.post('/:id/alerts/test', async (req: Request, res: Response) => {
+  const monitor = store.getMonitor(req.params.id);
+  if (!monitor) {
+    res.status(404).json({ error: 'Monitor not found' });
+    return;
+  }
+
+  try {
+    const success = await alertManager.sendTestAlert(monitor);
+    if (success) {
+      res.json({ message: 'Test alert delivered successfully' });
+    } else {
+      res.status(502).json({ error: 'Failed to deliver test alert to configured destination' });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Error sending test alert' });
   }
 });
 
-router.post('/', async (req: Request, res: Response) => {
-  try {
-    const validation = validateMonitorPayload(req.body, false);
-    if (!validation.valid) {
-      return res.status(400).json({ error: validation.error });
-    }
-
-    const payload: CreateMonitorDTO = {
-      name: req.body.name.trim(),
-      url: req.body.url.trim(),
-      method: req.body.method || 'GET',
-      intervalSeconds: req.body.intervalSeconds ?? 60,
-      timeoutMs: req.body.timeoutMs ?? 10000,
-      expectedStatusCode: req.body.expectedStatusCode ?? 200,
-      headers: req.body.headers ?? {},
-      body: req.body.body ? (typeof req.body.body === 'object' ? JSON.stringify(req.body.body) : req.body.body) : undefined,
-      latencyThresholdMs: req.body.latencyThresholdMs ?? 2000,
-      isActive: req.body.isActive ?? true,
-    };
-
-    const monitor = await store.createMonitor(payload);
-
-    if (monitor.isActive) {
-      prober.schedule(monitor);
-    }
-
-    return res.status(201).json(monitor);
-  } catch (err: any) {
-    return res.status(500).json({ error: 'Failed create monitor', details: err.message });
+monitorsRouter.get('/:id/incidents', (req: Request, res: Response) => {
+  const monitor = store.getMonitor(req.params.id);
+  if (!monitor) {
+    res.status(404).json({ error: 'Monitor not found' });
+    return;
   }
+
+  const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
+  const incidents = store.getIncidentsByMonitor(req.params.id, Math.min(limit, 200));
+  res.json(incidents);
 });
 
-router.patch('/:id', async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const existing = await store.getMonitorById(id);
-    if (!existing) {
-      return res.status(404).json({ error: 'Monitor not found' });
-    }
-
-    const validation = validateMonitorPayload(req.body, true);
-    if (!validation.valid) {
-      return res.status(400).json({ error: validation.error });
-    }
-
-    const payload: UpdateMonitorDTO = {};
-
-    if (req.body.name !== undefined) payload.name = req.body.name.trim();
-    if (req.body.url !== undefined) payload.url = req.body.url.trim();
-    if (req.body.method !== undefined) payload.method = req.body.method;
-    if (req.body.intervalSeconds !== undefined) payload.intervalSeconds = req.body.intervalSeconds;
-    if (req.body.timeoutMs !== undefined) payload.timeoutMs = req.body.timeoutMs;
-    if (req.body.expectedStatusCode !== undefined) payload.expectedStatusCode = req.body.expectedStatusCode;
-    if (req.body.headers !== undefined) payload.headers = req.body.headers;
-    if (req.body.body !== undefined) {
-      payload.body = typeof req.body.body === 'object' ? JSON.stringify(req.body.body) : req.body.body;
-    }
-    if (req.body.latencyThresholdMs !== undefined) payload.latencyThresholdMs = req.body.latencyThresholdMs;
-    if (req.body.isActive !== undefined) payload.isActive = req.body.isActive;
-
-    const updated = await store.updateMonitor(id, payload);
-    if (!updated) {
-      return res.status(404).json({ error: 'Monitor not found' });
-    }
-
-    prober.reschedule(updated);
-
-    return res.status(200).json(updated);
-  } catch (err: any) {
-    return res.status(500).json({ error: 'Failed update monitor', details: err.message });
+monitorsRouter.post('/:id/incidents/:incidentId/resolve', (req: Request, res: Response) => {
+  const monitor = store.getMonitor(req.params.id);
+  if (!monitor) {
+    res.status(404).json({ error: 'Monitor not found' });
+    return;
   }
-});
 
-router.delete('/:id', async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const existing = await store.getMonitorById(id);
-    if (!existing) {
-      return res.status(404).json({ error: 'Monitor not found' });
-    }
-
-    prober.cancel(id);
-    await store.deleteMonitor(id);
-
-    return res.status(204).send();
-  } catch (err: any) {
-    return res.status(500).json({ error: 'Failed delete monitor', details: err.message });
+  const incident = store.resolveIncident(req.params.incidentId);
+  if (!incident) {
+    res.status(404).json({ error: 'Incident not found or already resolved' });
+    return;
   }
+
+  res.json(incident);
 });
-
-router.post('/:id/test', async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const monitor = await store.getMonitorById(id);
-    if (!monitor) {
-      return res.status(404).json({ error: 'Monitor not found' });
-    }
-
-    const checkResult = await prober.runSingleCheck(monitor);
-    return res.status(200).json(checkResult);
-  } catch (err: any) {
-    return res.status(500).json({ error: 'Failed execute probe check', details: err.message });
-  }
-});
-
-router.get('/:id/history', async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const monitor = await store.getMonitorById(id);
-    if (!monitor) {
-      return res.status(404).json({ error: 'Monitor not found' });
-    }
-
-    const limitQuery = req.query.limit;
-    const sinceQuery = req.query.since;
-
-    const limit = limitQuery ? Math.min(Math.max(parseInt(String(limitQuery), 10) || 50, 1), 1000) : 50;
-    const since = sinceQuery ? parseInt(String(sinceQuery), 10) : undefined;
-
-    const history = await store.getLatencyHistory(id, { limit, since });
-    return res.status(200).json(history);
-  } catch (err: any) {
-    return res.status(500).json({ error: 'Failed fetch latency history', details: err.message });
-  }
-});
-
-router.get('/:id/stats', async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const monitor = await store.getMonitorById(id);
-    if (!monitor) {
-      return res.status(404).json({ error: 'Monitor not found' });
-    }
-
-    const periodMs = req.query.periodMs ? parseInt(String(req.query.periodMs), 10) : 86400000;
-    const stats = await store.getMonitorStats(id, periodMs);
-
-    return res.status(200).json(stats);
-  } catch (err: any) {
-    return res.status(500).json({ error: 'Failed calculate monitor stats', details: err.message });
-  }
-});
-
-export default router;
